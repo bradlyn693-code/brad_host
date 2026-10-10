@@ -1,4 +1,6 @@
-# nodeX
+# Fluxytech
+
+This complete application is also published in the `brad_host` repository.
 
 nodeX is a Vite + Express + MongoDB WhatsApp bot hosting workspace with secure email authentication, an internal KES wallet, Paystack Redirect checkout, database-backed files, and Heroku Teams deployment.
 
@@ -93,7 +95,7 @@ Set production environment variables in the hosting provider's Secrets, Config V
 
 ## NodeX Hosting bot catalog
 
-The dashboard now includes `/bots` and featured cards on Overview. The MongoDB `Bot` model seeds six catalog records: WOLFBOT, LITTLE FOXY, NIGHT OWL, IRON PANDA, SPARK JAGUAR, and ORBIT RAVEN. The two featured records use the supplied repositories and pair sites:
+The dashboard now includes `/bots` and featured cards on Overview. The MongoDB `Bot` model seeds two available catalog records: WOLFBOT and LITTLE FOXY. Legacy coming-soon catalog records are removed during startup. The two featured records use the supplied repositories and pair sites:
 
 - WOLFBOT: `https://github.com/WOLVAREX/silentwolf`, pair site `https://pairwolf.wolvarex.com`
 - LITTLE FOXY: `https://github.com/WOLVAREX/FOXY`, pair site `https://foxy.pairsite.space`
