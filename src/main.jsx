@@ -47,9 +47,9 @@ const menu = [
 function Sidebar({ path, user, onLogout, open, onClose }) {
   return <aside className={`sidebar ${open ? 'open' : ''}`}>
     <div className="sidebar-top"><Brand /><button className="mobile-close" onClick={onClose}><X size={18} /></button></div>
-    <div className="workspace-switch"><span className="workspace-dot" /><span><b>Personal workspace</b><small>Production</small></span><ChevronRight size={15} /></div>
+    <div className="workspace-switch"><span className="workspace-dot" /><span><b>{user.isDemo ? 'Demo workspace' : 'Personal workspace'}</b><small>{user.isDemo ? 'Testing only' : 'Production'}</small></span><ChevronRight size={15} /></div>
     <nav className="nav-list">{menu.map(({ path: itemPath, label, icon: Icon }) => <a key={itemPath} className={path === itemPath ? 'active' : ''} href={itemPath} onClick={(event) => { event.preventDefault(); navigate(itemPath); onClose(); }}><Icon size={17} /><span>{label}</span>{itemPath === '/wallet' && user.wallet_balance > 0 && <em>KES {user.wallet_balance}</em>}</a>)}</nav>
-    <div className="sidebar-bottom"><div className="secure-chip"><ShieldCheck size={15} /><span><b>Workspace secured</b><small>JWT session active</small></span></div><button className="logout-link" onClick={onLogout}><LogOut size={16} /> Sign out</button></div>
+    <div className="sidebar-bottom"><div className="secure-chip"><ShieldCheck size={15} /><span><b>{user.isDemo ? 'Demo access active' : 'Workspace secured'}</b><small>{user.isDemo ? 'Real payments disabled' : 'JWT session active'}</small></span></div><button className="logout-link" onClick={onLogout}><LogOut size={16} /> Sign out</button></div>
   </aside>;
 }
 
@@ -120,7 +120,7 @@ function PublicLanding() {
 }
 function App() {
   const [path, setPath] = useState(window.location.pathname); const [user, setUser] = useState(null); const [loading, setLoading] = useState(true);
-  useEffect(() => { const handler = () => setPath(window.location.pathname); window.addEventListener('popstate', handler); api('/api/auth/me').then(setUser).catch(() => {}).finally(() => setLoading(false)); return () => window.removeEventListener('popstate', handler); }, []);
+  useEffect(() => { const handler = () => setPath(window.location.pathname); window.addEventListener('popstate', handler); api('/api/auth/me').then(setUser).catch(() => api('/api/auth/demo', { method: 'POST' }).then((result) => setUser(result.user)).catch(() => {})).finally(() => setLoading(false)); return () => window.removeEventListener('popstate', handler); }, []);
   const logout = async () => { await api('/api/auth/logout', { method: 'POST' }).catch(() => {}); setUser(null); navigate('/login'); };
   if (loading) return <div className="loading-screen"><span className="brand-mark">nX</span><LoaderCircle className="spin" size={18} /></div>;
   if (!user) return <PublicLanding />;
