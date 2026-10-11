@@ -106,7 +106,3 @@ Public catalog APIs:
 - `GET /api/bots/all`
 
 Clicking Deploy opens the pair link and session-ID form. The authenticated `POST /api/deploy` accepts `botSlug`, `sessionId`, and `ownerNumber`, deducts KES 70 atomically, clones the selected public repository, sets secure runtime config vars including the runtime `MONGODB_URI`, pushes to Heroku, scales `web=1`, and refunds the wallet if deployment fails. Manage opens `/bots/:slug/logs`.
-
-## Demo workspace
-
-When no real JWT session is present, the frontend automatically opens a clearly labeled `Demo workspace` for UI and file-manager testing. The demo account starts with KES 0. Real Paystack payments and Heroku deployments are blocked in demo mode; authenticated production users retain the normal protected flows.
