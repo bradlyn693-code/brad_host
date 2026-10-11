@@ -22,6 +22,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 3001);
 const CLIENT_ORIGIN = process.env.FRONTEND_URL || 'http://localhost:5173';
 const COOKIE = 'nodex_session';
+const GUEST_COOKIE = 'fluxy_guest_wallet';
 const TOPUP_KES = 70;
 const TOPUP_MINOR = 7000;
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
@@ -36,11 +37,13 @@ const userSchema = new mongoose.Schema({
   resetCode: { type: String, select: false }, resetCodeExpiry: { type: Date, select: false },
   creditedPaymentRefs: { type: [String], default: [], select: false }, authVersion: { type: Number, default: 0 },
 }, { timestamps: true });
-const paymentSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, email: String, reference: { type: String, unique: true }, amount: { type: Number, default: TOPUP_MINOR }, currency: { type: String, default: 'KES' }, status: { type: String, enum: ['pending', 'credited', 'rejected'], default: 'pending' }, verifiedAt: Date }, { timestamps: true });
+const paymentSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, email: String, reference: { type: String, unique: true }, amount: { type: Number, default: TOPUP_MINOR }, currency: { type: String, default: 'KES' }, status: { type: String, enum: ['pending', 'credited', 'rejected'], default: 'pending' }, verifiedAt: Date }, { timestamps: true });
 const fileSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, filename: { type: String, required: true, trim: true, maxlength: 160 }, content: { type: String, required: true, maxlength: MAX_FILE_BYTES }, size: { type: Number, required: true, min: 0 } }, { timestamps: true });
 const deploymentSchema = new mongoose.Schema({ userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true }, appId: String, appName: String, appUrl: String, botSlug: String, botName: String, sessionId: String, status: { type: String, enum: ['pending', 'deployed', 'failed'], default: 'pending' }, stack: String, team: String, logs: { type: [String], default: [] } }, { timestamps: true });
+const guestWalletSchema = new mongoose.Schema({ email: { type: String, required: true, unique: true, lowercase: true, trim: true }, wallet_balance: { type: Number, default: 0, min: 0, validate: Number.isSafeInteger }, creditedPaymentRefs: { type: [String], default: [] } }, { timestamps: true });
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 const Payment = mongoose.models.Payment || mongoose.model('Payment', paymentSchema);
+const GuestWallet = mongoose.models.GuestWallet || mongoose.model('GuestWallet', guestWalletSchema);
 const File = mongoose.models.File || mongoose.model('File', fileSchema);
 const Deployment = mongoose.models.Deployment || mongoose.model('Deployment', deploymentSchema);
 
@@ -63,7 +66,10 @@ function profile(user) { return { id: String(user._id), email: user.email, walle
 function sign(user) { return jwt.sign({ sub: String(user._id), ver: user.authVersion || 0 }, process.env.JWT_SECRET, { algorithm: 'HS256', expiresIn: '12h', issuer: 'nodex' }); }
 function cookieOptions() { return { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', maxAge: 12 * 60 * 60 * 1000, path: '/' }; }
 function setSession(res, user) { res.cookie(COOKIE, sign(user), cookieOptions()); }
+function setGuestSession(res, email) { res.cookie(GUEST_COOKIE, jwt.sign({ guestEmail: email }, process.env.JWT_SECRET, { algorithm: 'HS256', expiresIn: '24h', issuer: 'fluxy-guest' }), { httpOnly: true, secure: true, sameSite: 'none', maxAge: 24 * 60 * 60 * 1000, path: '/' }); }
+function guestEmail(req) { try { const claims = jwt.verify(req.cookies[GUEST_COOKIE] || '', process.env.JWT_SECRET, { algorithms: ['HS256'], issuer: 'fluxy-guest' }); return normalizeEmail(claims.guestEmail); } catch { return ''; } }
 async function requireAuth(req, res, next) { try { const claims = jwt.verify(req.cookies[COOKIE] || '', process.env.JWT_SECRET, { algorithms: ['HS256'], issuer: 'nodex' }); const user = await User.findById(claims.sub).select('+passwordHash'); if (!user || Number(user.authVersion || 0) !== Number(claims.ver || 0)) throw new Error('invalid'); req.user = user; next(); } catch { res.status(401).json({ error: 'Sign in to continue.' }); } }
+async function optionalAuth(req, _res, next) { try { const claims = jwt.verify(req.cookies[COOKIE] || '', process.env.JWT_SECRET, { algorithms: ['HS256'], issuer: 'nodex' }); const user = await User.findById(claims.sub).select('+passwordHash'); if (user && Number(user.authVersion || 0) === Number(claims.ver || 0)) req.user = user; } catch {} next(); }
 async function sendResetEmail(to, code) { if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) throw new Error('SMTP is not configured.'); const transport = nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: process.env.SMTP_SECURE === 'true', auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } }); await transport.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject: 'nodeX password reset code', text: `Your nodeX password reset code is ${code}. It expires in 15 minutes.` }); transport.close(); }
 
 function validPaystackSignature(req) {
@@ -77,14 +83,13 @@ function validPaystackSignature(req) {
 }
 app.post('/api/paystack/webhook', async (req, res) => {
   if (!validPaystackSignature(req)) return res.status(401).json({ error: 'Invalid Paystack signature.' });
-  const event = req.body || {};
-  const data = event.data || {};
+  const event = req.body || {}; const data = event.data || {};
   if (event.event === 'charge.success') {
-    const reference = String(data.reference || '').trim();
-    const payment = await Payment.findOne({ reference });
+    const reference = String(data.reference || '').trim(); const payment = await Payment.findOne({ reference });
     const matches = payment && Number(data.amount) === TOPUP_MINOR && String(data.currency).toUpperCase() === 'KES' && String(data.status).toLowerCase() === 'success' && String(data.customer?.email || '').toLowerCase() === String(payment.email || '').toLowerCase();
     if (matches) {
-      await User.findOneAndUpdate({ _id: payment.userId, creditedPaymentRefs: { $ne: reference } }, { $inc: { wallet_balance: TOPUP_KES }, $addToSet: { creditedPaymentRefs: reference } }, { new: true });
+      if (payment.userId) await User.findOneAndUpdate({ _id: payment.userId, creditedPaymentRefs: { $ne: reference } }, { $inc: { wallet_balance: TOPUP_KES }, $addToSet: { creditedPaymentRefs: reference } }, { new: true });
+      else await GuestWallet.findOneAndUpdate({ email: payment.email, creditedPaymentRefs: { $ne: reference } }, { $inc: { wallet_balance: TOPUP_KES }, $addToSet: { creditedPaymentRefs: reference } }, { new: true, upsert: true, setDefaultsOnInsert: true });
       await Payment.updateOne({ _id: payment._id }, { $set: { status: 'credited', verifiedAt: new Date() } });
     }
   }
@@ -102,12 +107,50 @@ app.post('/api/auth/verify-reset-code', async (req, res) => { const email = norm
 app.get('/api/auth/me', requireAuth, (req, res) => res.json(profile(req.user)));
 app.post('/api/auth/logout', (req, res) => { res.clearCookie(COOKIE, cookieOptions()); res.json({ success: true }); });
 
-async function initializePaystack(req, res) { if (!process.env.PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Paystack is not configured.' }); const email = req.user.email; const frontendUrl = (process.env.FRONTEND_URL || 'https://bradhost.vercel.app').replace(/\/$/, ''); const callbackUrl = process.env.PAYSTACK_CALLBACK_URL || `${frontendUrl}/api/paystack/callback`; let response; try { response = await fetch('https://api.paystack.co/transaction/initialize', { method: 'POST', headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ email, amount: TOPUP_MINOR, currency: 'KES', callback_url: callbackUrl, metadata: { type: 'wallet_topup', userId: String(req.user._id) } }) }); } catch { return res.status(502).json({ error: 'Paystack could not be reached.' }); } const data = await response.json().catch(() => ({})); if (!response.ok || !data.status || !data.data?.reference || !data.data?.authorization_url) return res.status(502).json({ error: data.message || 'Paystack checkout could not be initialized.' }); await Payment.create({ userId: req.user._id, email, reference: data.data.reference, amount: TOPUP_MINOR, currency: 'KES', status: 'pending' }); res.status(201).json(data); }
-app.post('/api/wallet/paystack/initialize', requireAuth, initializePaystack);
-app.post('/api/paystack/initialize', requireAuth, initializePaystack);
-app.post('/api/wallet/paystack/verify', requireAuth, async (req, res) => { const reference = String(req.body?.reference || '').trim(); const payment = await Payment.findOne({ reference, userId: req.user._id }); if (!payment) return res.status(404).json({ error: 'Payment reference not found.' }); if (payment.status === 'credited') return res.json({ success: true, alreadyCredited: true, wallet_balance: req.user.wallet_balance }); let response; try { response = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`, { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }); } catch { return res.status(502).json({ error: 'Paystack could not be reached.' }); } const envelope = await response.json().catch(() => null); const tx = envelope?.data; const matches = response.ok && envelope?.status && tx?.reference === reference && Number(tx.amount) === TOPUP_MINOR && String(tx.currency).toUpperCase() === 'KES' && String(tx.customer?.email).toLowerCase() === payment.email && String(tx.status).toLowerCase() === 'success'; if (!matches) return res.status(409).json({ error: 'Payment did not verify as a successful KES 70 transaction.' }); const credited = await User.findOneAndUpdate({ _id: req.user._id, creditedPaymentRefs: { $ne: reference } }, { $inc: { wallet_balance: TOPUP_KES }, $addToSet: { creditedPaymentRefs: reference } }, { new: true }); await Payment.updateOne({ _id: payment._id }, { $set: { status: 'credited', verifiedAt: new Date() } }); res.json({ success: true, wallet_balance: (credited || await User.findById(req.user._id)).wallet_balance }); });
-app.get('/api/wallet/balance', requireAuth, (req, res) => res.json({ wallet_balance: req.user.wallet_balance }));
-
+async function initializePaystack(req, res) {
+  if (req.user?.isDemo) return res.status(403).json({ error: 'Demo mode is not available.' });
+  if (!process.env.PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Paystack is not configured.' });
+  const email = normalizeEmail(req.user?.email || req.body?.email);
+  if (!validEmail(email)) return res.status(400).json({ error: 'Enter a valid email address for the Paystack receipt.' });
+  const frontendUrl = (process.env.FRONTEND_URL || 'https://bradhost.vercel.app').replace(/\/$/, '');
+  const callbackUrl = process.env.PAYSTACK_CALLBACK_URL || `${frontendUrl}/api/paystack/callback`;
+  let response;
+  try { response = await fetch('https://api.paystack.co/transaction/initialize', { method: 'POST', headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ email, amount: TOPUP_MINOR, currency: 'KES', callback_url: callbackUrl, metadata: { type: 'wallet_topup', userId: req.user ? String(req.user._id) : undefined, guest: !req.user } }) }); } catch { return res.status(502).json({ error: 'Paystack could not be reached.' }); }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.status || !data.data?.reference || !data.data?.authorization_url) return res.status(502).json({ error: data.message || 'Paystack checkout could not be initialized.' });
+  await Payment.create({ ...(req.user ? { userId: req.user._id } : {}), email, reference: data.data.reference, amount: TOPUP_MINOR, currency: 'KES', status: 'pending' });
+  if (!req.user) setGuestSession(res, email);
+  res.status(201).json(data);
+}
+app.post('/api/wallet/paystack/initialize', optionalAuth, initializePaystack);
+app.post('/api/paystack/initialize', optionalAuth, initializePaystack);
+async function verifyPaystack(req, res) {
+  const reference = String(req.body?.reference || '').trim();
+  const payment = await Payment.findOne({ reference });
+  if (!payment) return res.status(404).json({ error: 'Payment reference not found.' });
+  if (req.user && payment.userId && String(payment.userId) !== String(req.user._id)) return res.status(403).json({ error: 'Payment does not belong to this account.' });
+  if (payment.status === 'credited') {
+    const balance = payment.userId ? (await User.findById(payment.userId))?.wallet_balance || 0 : (await GuestWallet.findOne({ email: payment.email }))?.wallet_balance || 0;
+    return res.json({ success: true, alreadyCredited: true, wallet_balance: balance });
+  }
+  let response;
+  try { response = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`, { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }); } catch { return res.status(502).json({ error: 'Paystack could not be reached.' }); }
+  const envelope = await response.json().catch(() => null); const tx = envelope?.data;
+  const matches = response.ok && envelope?.status && tx?.reference === reference && Number(tx.amount) === TOPUP_MINOR && String(tx.currency).toUpperCase() === 'KES' && String(tx.customer?.email).toLowerCase() === payment.email && String(tx.status).toLowerCase() === 'success';
+  if (!matches) return res.status(409).json({ error: 'Payment did not verify as a successful KES 70 transaction.' });
+  let credited;
+  if (payment.userId) credited = await User.findOneAndUpdate({ _id: payment.userId, creditedPaymentRefs: { $ne: reference } }, { $inc: { wallet_balance: TOPUP_KES }, $addToSet: { creditedPaymentRefs: reference } }, { new: true });
+  else credited = await GuestWallet.findOneAndUpdate({ email: payment.email, creditedPaymentRefs: { $ne: reference } }, { $inc: { wallet_balance: TOPUP_KES }, $addToSet: { creditedPaymentRefs: reference } }, { new: true, upsert: true, setDefaultsOnInsert: true });
+  await Payment.updateOne({ _id: payment._id }, { $set: { status: 'credited', verifiedAt: new Date() } });
+  if (!payment.userId) setGuestSession(res, payment.email);
+  res.json({ success: true, wallet_balance: credited?.wallet_balance || 0 });
+}
+app.post('/api/wallet/paystack/verify', optionalAuth, verifyPaystack);
+app.get('/api/wallet/balance', optionalAuth, async (req, res) => {
+  if (req.user) return res.json({ wallet_balance: req.user.wallet_balance });
+  const email = guestEmail(req); const wallet = email ? await GuestWallet.findOne({ email }) : null;
+  res.json({ wallet_balance: wallet?.wallet_balance || 0, guest: true });
+});
 function cleanFilename(value) { const filename = path.basename(String(value || '').trim()); if (!filename || filename === '.' || filename.length > 160 || /[\0\\/]/.test(filename)) throw new Error('Enter a valid filename.'); return filename; }
 function filePayload(file) { return { id: String(file._id), filename: file.filename, content: file.content, size: file.size, updatedAt: file.updatedAt, createdAt: file.createdAt }; }
 app.post('/api/files/upload', requireAuth, async (req, res) => { try { const filename = cleanFilename(req.body?.filename); const content = typeof req.body?.content === 'string' ? req.body.content : ''; const size = Buffer.byteLength(content, 'utf8'); if (size > MAX_FILE_BYTES) return res.status(413).json({ error: 'File is larger than 5 MB.' }); const file = await File.create({ userId: req.user._id, filename, content, size }); res.status(201).json({ file: filePayload(file) }); } catch (error) { res.status(400).json({ error: error.message || 'File upload failed.' }); } });
