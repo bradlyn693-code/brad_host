@@ -53,7 +53,7 @@ function publicBot(bot) { const value = bot.toObject ? bot.toObject() : bot; ret
 
 app.use(helmet());
 app.use(cors({ origin: CLIENT_ORIGIN, credentials: true }));
-app.use(express.json({ limit: '8mb' }));
+app.use(express.json({ limit: '8mb', verify: (req, _res, buffer) => { req.rawBody = Buffer.from(buffer); } }));
 app.use(cookieParser());
 app.use('/api/auth', rateLimit({ windowMs: 15 * 60_000, limit: 30 }));
 
@@ -66,6 +66,34 @@ function setSession(res, user) { res.cookie(COOKIE, sign(user), cookieOptions())
 async function requireAuth(req, res, next) { try { const claims = jwt.verify(req.cookies[COOKIE] || '', process.env.JWT_SECRET, { algorithms: ['HS256'], issuer: 'nodex' }); const user = await User.findById(claims.sub).select('+passwordHash'); if (!user || Number(user.authVersion || 0) !== Number(claims.ver || 0)) throw new Error('invalid'); req.user = user; next(); } catch { res.status(401).json({ error: 'Sign in to continue.' }); } }
 async function sendResetEmail(to, code) { if (!process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) throw new Error('SMTP is not configured.'); const transport = nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT || 587), secure: process.env.SMTP_SECURE === 'true', auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } }); await transport.sendMail({ from: process.env.SMTP_FROM || process.env.SMTP_USER, to, subject: 'nodeX password reset code', text: `Your nodeX password reset code is ${code}. It expires in 15 minutes.` }); transport.close(); }
 
+function validPaystackSignature(req) {
+  const signature = String(req.headers['x-paystack-signature'] || '');
+  const secret = process.env.PAYSTACK_SECRET_KEY || '';
+  if (!signature || !secret || !req.rawBody) return false;
+  const expected = crypto.createHmac('sha512', secret).update(req.rawBody).digest('hex');
+  const actualBuffer = Buffer.from(signature, 'utf8');
+  const expectedBuffer = Buffer.from(expected, 'utf8');
+  return actualBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(actualBuffer, expectedBuffer);
+}
+app.post('/api/paystack/webhook', async (req, res) => {
+  if (!validPaystackSignature(req)) return res.status(401).json({ error: 'Invalid Paystack signature.' });
+  const event = req.body || {};
+  const data = event.data || {};
+  if (event.event === 'charge.success') {
+    const reference = String(data.reference || '').trim();
+    const payment = await Payment.findOne({ reference });
+    const matches = payment && Number(data.amount) === TOPUP_MINOR && String(data.currency).toUpperCase() === 'KES' && String(data.status).toLowerCase() === 'success' && String(data.customer?.email || '').toLowerCase() === String(payment.email || '').toLowerCase();
+    if (matches) {
+      await User.findOneAndUpdate({ _id: payment.userId, creditedPaymentRefs: { $ne: reference } }, { $inc: { wallet_balance: TOPUP_KES }, $addToSet: { creditedPaymentRefs: reference } }, { new: true });
+      await Payment.updateOne({ _id: payment._id }, { $set: { status: 'credited', verifiedAt: new Date() } });
+    }
+  }
+  res.json({ received: true });
+});
+app.get('/api/paystack/callback', (req, res) => {
+  const reference = String(req.query.reference || req.query.trxref || '').trim();
+  res.redirect(reference ? `/wallet?reference=${encodeURIComponent(reference)}` : '/wallet');
+});
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'nodex' }));
 app.post('/api/auth/signup', async (req, res) => { const email = normalizeEmail(req.body?.email); const password = req.body?.password; if (!validEmail(email)) return res.status(400).json({ error: 'Enter a valid email address.' }); if (typeof password !== 'string' || password.length < 8 || password.length > 128) return res.status(400).json({ error: 'Password must be 8–128 characters.' }); try { const user = await User.create({ email, passwordHash: await bcrypt.hash(password, 12) }); setSession(res, user); res.status(201).json({ success: true, user: profile(user) }); } catch (error) { if (error?.code === 11000) return res.status(409).json({ error: 'An account already exists for that email.' }); res.status(500).json({ error: 'Account creation failed.' }); } });
 app.post('/api/auth/login', async (req, res) => { const email = normalizeEmail(req.body?.email); const password = req.body?.password; const user = validEmail(email) ? await User.findOne({ email }).select('+passwordHash') : null; if (!user || typeof password !== 'string' || !(await bcrypt.compare(password, user.passwordHash))) return res.status(401).json({ error: 'Email or password is incorrect.' }); setSession(res, user); res.json({ success: true, user: profile(user) }); });
@@ -74,7 +102,9 @@ app.post('/api/auth/verify-reset-code', async (req, res) => { const email = norm
 app.get('/api/auth/me', requireAuth, (req, res) => res.json(profile(req.user)));
 app.post('/api/auth/logout', (req, res) => { res.clearCookie(COOKIE, cookieOptions()); res.json({ success: true }); });
 
-app.post('/api/wallet/paystack/initialize', requireAuth, async (req, res) => { if (!process.env.PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Paystack is not configured.' }); const email = req.user.email; const frontendUrl = (process.env.FRONTEND_URL || 'https://nodexhost-rqxzwodb.manus.space').replace(/\/$/, ''); let response; try { response = await fetch('https://api.paystack.co/transaction/initialize', { method: 'POST', headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ email, amount: TOPUP_MINOR, currency: 'KES', callback_url: `${frontendUrl}/wallet`, metadata: { type: 'wallet_topup', userId: String(req.user._id) } }) }); } catch { return res.status(502).json({ error: 'Paystack could not be reached.' }); } const data = await response.json().catch(() => ({})); if (!response.ok || !data.status || !data.data?.reference || !data.data?.authorization_url) return res.status(502).json({ error: data.message || 'Paystack checkout could not be initialized.' }); await Payment.create({ userId: req.user._id, email, reference: data.data.reference, amount: TOPUP_MINOR, currency: 'KES', status: 'pending' }); res.status(201).json(data); });
+async function initializePaystack(req, res) { if (!process.env.PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Paystack is not configured.' }); const email = req.user.email; const frontendUrl = (process.env.FRONTEND_URL || 'https://bradhost.vercel.app').replace(/\/$/, ''); const callbackUrl = process.env.PAYSTACK_CALLBACK_URL || `${frontendUrl}/api/paystack/callback`; let response; try { response = await fetch('https://api.paystack.co/transaction/initialize', { method: 'POST', headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ email, amount: TOPUP_MINOR, currency: 'KES', callback_url: callbackUrl, metadata: { type: 'wallet_topup', userId: String(req.user._id) } }) }); } catch { return res.status(502).json({ error: 'Paystack could not be reached.' }); } const data = await response.json().catch(() => ({})); if (!response.ok || !data.status || !data.data?.reference || !data.data?.authorization_url) return res.status(502).json({ error: data.message || 'Paystack checkout could not be initialized.' }); await Payment.create({ userId: req.user._id, email, reference: data.data.reference, amount: TOPUP_MINOR, currency: 'KES', status: 'pending' }); res.status(201).json(data); }
+app.post('/api/wallet/paystack/initialize', requireAuth, initializePaystack);
+app.post('/api/paystack/initialize', requireAuth, initializePaystack);
 app.post('/api/wallet/paystack/verify', requireAuth, async (req, res) => { const reference = String(req.body?.reference || '').trim(); const payment = await Payment.findOne({ reference, userId: req.user._id }); if (!payment) return res.status(404).json({ error: 'Payment reference not found.' }); if (payment.status === 'credited') return res.json({ success: true, alreadyCredited: true, wallet_balance: req.user.wallet_balance }); let response; try { response = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`, { headers: { Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}` } }); } catch { return res.status(502).json({ error: 'Paystack could not be reached.' }); } const envelope = await response.json().catch(() => null); const tx = envelope?.data; const matches = response.ok && envelope?.status && tx?.reference === reference && Number(tx.amount) === TOPUP_MINOR && String(tx.currency).toUpperCase() === 'KES' && String(tx.customer?.email).toLowerCase() === payment.email && String(tx.status).toLowerCase() === 'success'; if (!matches) return res.status(409).json({ error: 'Payment did not verify as a successful KES 70 transaction.' }); const credited = await User.findOneAndUpdate({ _id: req.user._id, creditedPaymentRefs: { $ne: reference } }, { $inc: { wallet_balance: TOPUP_KES }, $addToSet: { creditedPaymentRefs: reference } }, { new: true }); await Payment.updateOne({ _id: payment._id }, { $set: { status: 'credited', verifiedAt: new Date() } }); res.json({ success: true, wallet_balance: (credited || await User.findById(req.user._id)).wallet_balance }); });
 app.get('/api/wallet/balance', requireAuth, (req, res) => res.json({ wallet_balance: req.user.wallet_balance }));
 
@@ -103,5 +133,6 @@ app.post('/api/deploy', requireAuth, async (req, res) => { if (req.body?.botSlug
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 app.use(express.static(path.resolve(__dirname, '../dist')));
 app.get('*', (_req, res) => res.sendFile(path.resolve(__dirname, '../dist/index.html')));
-app.listen(PORT, '0.0.0.0', () => console.log(`nodeX API listening on ${PORT}`));
+if (process.env.VERCEL !== '1') app.listen(PORT, '0.0.0.0', () => console.log(`nodeX API listening on ${PORT}`));
+export default app;
 mongoose.connect(process.env.MONGODB_URI || '').then(async () => { await seedBots(); console.log('MongoDB connected; bot catalog seeded'); }).catch((error) => console.error('MongoDB connection failed; auth and wallet APIs will remain unavailable until Atlas allows this runtime:', error.message));

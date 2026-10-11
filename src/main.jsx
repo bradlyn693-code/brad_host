@@ -115,12 +115,15 @@ function WalletPage({ user, setUser }) {
 
 function SettingsPage({ user }) { return <><PageHeading eyebrow="WORKSPACE / SETTINGS" title="Settings" subtitle="Review your Fluxytech account and workspace configuration." /><div className="settings-grid"><section className="panel"><div className="panel-head"><div><span className="section-kicker">ACCOUNT</span><h2>Profile</h2></div><UserPlus size={18} className="green-text" /></div><div className="settings-row"><span>Email address</span><b>{user.email}</b></div><div className="settings-row"><span>Session</span><b className="status-text"><span className="status-dot" /> Secure</b></div><div className="settings-row"><span>Wallet policy</span><b>Non-withdrawable</b></div></section><section className="panel"><div className="panel-head"><div><span className="section-kicker">PLATFORM</span><h2>Runtime details</h2></div><Terminal size={18} className="green-text" /></div><div className="settings-row"><span>Environment</span><b>Production</b></div><div className="settings-row"><span>Payment provider</span><b>Paystack Redirect</b></div><div className="settings-row"><span>Deploy target</span><b>Heroku Teams</b></div></section></div></>; }
 
+function PublicLanding() {
+  return <main className="auth-wrap"><div className="auth-card"><div className="eyebrow">FLUXYTECH HOSTING</div><h1>Build. Deploy. Run.</h1><p className="muted">Fluxytech is ready for secure WhatsApp bot hosting, Paystack funding, file management, and Heroku deployments.</p><div className="notice"><ShieldCheck size={16} /><span>Protected workspace APIs remain available to authenticated sessions.</span></div></div></main>;
+}
 function App() {
   const [path, setPath] = useState(window.location.pathname); const [user, setUser] = useState(null); const [loading, setLoading] = useState(true);
   useEffect(() => { const handler = () => setPath(window.location.pathname); window.addEventListener('popstate', handler); api('/api/auth/me').then(setUser).catch(() => {}).finally(() => setLoading(false)); return () => window.removeEventListener('popstate', handler); }, []);
   const logout = async () => { await api('/api/auth/logout', { method: 'POST' }).catch(() => {}); setUser(null); navigate('/login'); };
   if (loading) return <div className="loading-screen"><span className="brand-mark">nX</span><LoaderCircle className="spin" size={18} /></div>;
-  if (!user) { if (path === '/forgot-password') return <Forgot />; return <AuthCard mode={path === '/signup' ? 'signup' : 'login'} onUser={setUser} />; }
+  if (!user) return <PublicLanding />;
   let page = <OverviewPage user={user} api={api} navigate={navigate} />; if (path === '/bots') page = <AvailableBots api={api} navigate={navigate} />; if (path.startsWith('/bots/') && path.endsWith('/logs')) page = <BotLogsPage slug={path.split('/')[2]} api={api} navigate={navigate} />; if (path === '/files') page = <FilesPage />; if (path === '/deployments') page = <DeploymentsPage />; if (path === '/wallet') page = <WalletPage user={user} setUser={setUser} />; if (path === '/settings') page = <SettingsPage user={user} />;
   return <AppShell path={path} user={user} onLogout={logout}>{page}</AppShell>;
 }
